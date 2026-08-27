@@ -1,5 +1,4 @@
 import { CronExpressionParser } from 'cron-parser'
-import cronstrue from 'cronstrue'
 import {
     MakeLogicType,
     actions,
@@ -29,6 +28,7 @@ import { ACTIVITY_SEARCH_PARAM } from 'lib/components/ActivityLog/activityLogLog
 import { tryShowMCPHint } from 'lib/components/MCPHint/mcpHintLogic'
 import { SetupTaskId, globalSetupLogic } from 'lib/components/ProductSetup'
 import { FEATURE_FLAGS } from 'lib/constants'
+import { describeCron } from 'lib/cron'
 import { Dayjs, dayjs } from 'lib/dayjs'
 import { scrollToFormError } from 'lib/forms/scrollToFormError'
 import { LemonDialog } from 'lib/lemon-ui/LemonDialog'
@@ -81,6 +81,7 @@ import {
     RecordingUniversalFilters,
     RecurrenceInterval,
     ScheduledChangeOperationType,
+    ScheduledChangeRequestState,
     ScheduledChangeType,
     Survey,
     SurveyQuestionType,
@@ -256,26 +257,6 @@ interface PairedPresetDefinition {
     disableCron: string
 }
 
-/** Human-readable description of a 5-field cron expression, or an error string. Returns null for empty input. */
-export function describeCron(expr: string | null): string | null {
-    if (!expr) {
-        return null
-    }
-    const fields = expr.trim().split(/\s+/)
-    if (fields.length !== 5) {
-        return 'Invalid cron expression'
-    }
-    try {
-        // Validate with cron-parser first — cronstrue is lenient and can
-        // produce garbled output (e.g. "Monday through undefined") for
-        // syntactically incomplete expressions like "0 9 * * 1-".
-        CronExpressionParser.parse(expr)
-        return cronstrue.toString(expr)
-    } catch {
-        return 'Invalid cron expression'
-    }
-}
-
 /**
  * Schedule pickers operate on the browser's wall clock, but users expect the time they enter
  * to be interpreted in the project's timezone (shown via `ScheduleTimezoneHint`).
@@ -322,6 +303,19 @@ export function byExecutedAt(a: ScheduledChangeType, b: ScheduledChangeType): nu
         return Number.isNaN(ms) ? Number.NEGATIVE_INFINITY : ms
     }
     return epoch(b) - epoch(a) || b.id - a.id
+}
+
+// A one-time schedule whose approval request was rejected or expired will never apply: the
+// applier skips it at fire time. It reads as terminal in the UI and sorts with history.
+// Recurring schedules are excluded because each occurrence is re-gated with a fresh request.
+export function isScheduleDeniedApproval(sc: ScheduledChangeType): boolean {
+    return (
+        !sc.is_recurring &&
+        !sc.recurrence_interval &&
+        !sc.cron_expression &&
+        (sc.change_request?.state === ScheduledChangeRequestState.Rejected ||
+            sc.change_request?.state === ScheduledChangeRequestState.Expired)
+    )
 }
 
 export const PAIRED_PRESETS: Record<Exclude<PairedPresetKey, 'custom_pair'>, PairedPresetDefinition> = {
@@ -460,6 +454,30 @@ export function validateFeatureFlagVariantKey(key: string): string | undefined {
           : !key.match?.(/^[a-zA-Z0-9_\-./]+$/)
             ? 'Only letters, numbers, hyphens (-), underscores (_), dots (.) & slashes (/) are allowed.'
             : undefined
+}
+
+function getVariantRolloutSum(variants: MultivariateFlagVariant[] = []): number {
+    return variants.reduce((sum, { rollout_percentage }) => sum + (rollout_percentage || 0), 0)
+}
+
+// Absorbs float drift (0.01/64.04/35.95 adds up to 100.00000000000001) while staying below the
+// 0.01 this form can express. Mirrored by products/feature_flags/backend/variant_rollout.py.
+const ROLLOUT_SUM_TOLERANCE = 1e-9
+
+/** Reason string when variant rollouts do not add up, otherwise undefined.
+ * Boolean flags carry no variants and are exempt. */
+export function validateVariantRolloutSum(variants?: MultivariateFlagVariant[]): string | undefined {
+    if (!variants?.length) {
+        return undefined
+    }
+    const rolloutSum = getVariantRolloutSum(variants)
+    if (Math.abs(rolloutSum - 100) <= ROLLOUT_SUM_TOLERANCE) {
+        return undefined
+    }
+    // Hides float artifacts (99.05000000000001), but stays finer than the tolerance above so a
+    // rejected total never reads as exactly 100.
+    const displayedSum = parseFloat(rolloutSum.toFixed(10))
+    return `Percentage rollouts for variants must sum to 100 (currently ${displayedSum}).`
 }
 
 function validatePayloadRequired(is_remote_configuration: boolean, payload?: JsonType): string | undefined {
@@ -720,7 +738,6 @@ export interface featureFlagLogicValues {
     activeSchedules: ScheduledChangeType[]
     activeTab: FeatureFlagsTab
     aggregationTargetName: string
-    areVariantRolloutsValid: boolean
     availableTabs: FeatureFlagsTab[]
     breadcrumbs: Breadcrumb[]
     canCreateEarlyAccessFeature: boolean
@@ -915,7 +932,6 @@ export interface featureFlagLogicValues {
     urlIntentApplied: boolean
     urlTemplateApplied: boolean
     variantErrors: VariantError[]
-    variantRolloutSum: number
     variants: MultivariateFlagVariant[]
 }
 
@@ -992,18 +1008,10 @@ export interface featureFlagLogicActions {
         errorObject?: any
     }
     createScheduledChangeSuccess: (
-        scheduledChange:
-            | {
-                  scheduled_change: ScheduledChangeType
-              }
-            | undefined,
+        scheduledChange: ScheduledChangeType | undefined,
         payload?: any
     ) => {
-        scheduledChange:
-            | {
-                  scheduled_change: ScheduledChangeType
-              }
-            | undefined
+        scheduledChange: ScheduledChangeType | undefined
         payload?: any
     }
     createStaticCohort: () => any
@@ -1893,8 +1901,6 @@ export interface featureFlagLogicMeta {
         ) => boolean
         variants: (featureFlag: FeatureFlagType) => MultivariateFlagVariant[]
         nonEmptyVariants: (variants: MultivariateFlagVariant[]) => MultivariateFlagVariant[]
-        variantRolloutSum: (variants: MultivariateFlagVariant[]) => number
-        areVariantRolloutsValid: (variants: MultivariateFlagVariant[], variantRolloutSum: number) => boolean
         aggregationTargetName: (
             featureFlag: FeatureFlagType,
             aggregationLabel: (groupTypeIndex: number | null | undefined, deferToUserWording?: boolean) => Noun // groupsModel
@@ -2082,6 +2088,7 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
                 ensure_experience_continuity: values.currentTeam?.flags_persistence_default || false,
             },
             errors: ({ key, filters, is_remote_configuration }) => {
+                const rolloutSumError = validateVariantRolloutSum(filters?.multivariate?.variants)
                 return {
                     key: validateFeatureFlagKey(key),
                     filters: {
@@ -2089,6 +2096,9 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
                             variants: filters?.multivariate?.variants?.map(
                                 ({ key: variantKey }: MultivariateFlagVariant) => ({
                                     key: validateFeatureFlagVariantKey(variantKey),
+                                    // One string on the array key (the usual form) can't say which
+                                    // panels to expand, so the set-level error fans out per index.
+                                    rollout_percentage: rolloutSumError,
                                 })
                             ),
                         },
@@ -3406,8 +3416,9 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             }
 
             // Create the enable schedule first
+            let enableSchedule: ScheduledChangeType
             try {
-                await api.featureFlags.createScheduledChange(currentProjectId, {
+                enableSchedule = await api.featureFlags.createScheduledChange(currentProjectId, {
                     ...basePayload,
                     payload: { operation: ScheduledChangeOperationType.UpdateStatus, value: true },
                     cron_expression: enableCron,
@@ -3419,8 +3430,9 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             }
 
             // Create the disable schedule
+            let disableSchedule: ScheduledChangeType
             try {
-                await api.featureFlags.createScheduledChange(currentProjectId, {
+                disableSchedule = await api.featureFlags.createScheduledChange(currentProjectId, {
                     ...basePayload,
                     payload: { operation: ScheduledChangeOperationType.UpdateStatus, value: false },
                     cron_expression: disableCron,
@@ -3436,7 +3448,16 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             }
 
             // Both succeeded
-            lemonToast.success('Paired schedules created')
+            const pairIsPendingApproval = [enableSchedule, disableSchedule].some(
+                (schedule) => schedule?.change_request?.state === ScheduledChangeRequestState.Pending
+            )
+            if (pairIsPendingApproval) {
+                lemonToast.success(
+                    'Paired schedules created - pending approval. Schedules that are not approved before their scheduled time will be skipped.'
+                )
+            } else {
+                lemonToast.success('Paired schedules created')
+            }
             resetScheduleForm()
             eventUsageLogic.actions.reportFeatureFlagScheduleSuccess()
         },
@@ -3455,11 +3476,11 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             const formErrors = values.featureFlagErrors as DeepPartialMap<FeatureFlagType, ValidationErrorType>
             const filtersErrors = formErrors?.filters as any
             const variantErrorsList = filtersErrors?.multivariate?.variants as
-                | Array<{ key?: string } | undefined>
+                | Array<{ key?: string; rollout_percentage?: string } | undefined>
                 | undefined
             const variantKeysWithErrors =
                 variantErrorsList
-                    ?.map((err, index) => (err?.key ? `variant-${index}` : null))
+                    ?.map((err, index) => (err?.key || err?.rollout_percentage ? `variant-${index}` : null))
                     .filter((key): key is string => key !== null) ?? []
             if (variantKeysWithErrors.length) {
                 actions.setOpenVariants(Array.from(new Set([...values.openVariants, ...variantKeysWithErrors])))
@@ -3874,7 +3895,13 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
         },
         createScheduledChangeSuccess: ({ scheduledChange }) => {
             if (scheduledChange) {
-                lemonToast.success('Change scheduled successfully')
+                if (scheduledChange.change_request?.state === ScheduledChangeRequestState.Pending) {
+                    lemonToast.success(
+                        'Change scheduled - pending approval. It will be skipped if not approved before the scheduled time.'
+                    )
+                } else {
+                    lemonToast.success('Change scheduled successfully')
+                }
                 actions.setScheduleDateMarker(null)
                 actions.setSchedulePayload(NEW_FLAG.filters, NEW_FLAG.active, {}, null, null)
                 actions.setIsRecurring(false)
@@ -4231,17 +4258,6 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             (s) => [s.variants],
             (variants: MultivariateFlagVariant[]) => variants.filter(({ key }) => !!key),
         ],
-        variantRolloutSum: [
-            (s) => [s.variants],
-            (variants: MultivariateFlagVariant[]) =>
-                variants.reduce((total: number, { rollout_percentage }) => total + rollout_percentage, 0),
-        ],
-        areVariantRolloutsValid: [
-            (s) => [s.variants, s.variantRolloutSum],
-            (variants: MultivariateFlagVariant[], variantRolloutSum: number) =>
-                variants.every(({ rollout_percentage }) => rollout_percentage >= 0 && rollout_percentage <= 100) &&
-                variantRolloutSum === 100,
-        ],
         aggregationTargetName: [
             (s) => [s.featureFlag, s.aggregationLabel],
             (
@@ -4444,13 +4460,18 @@ export const featureFlagLogic = kea<featureFlagLogicType>([
             (s) => [s.scheduledChanges],
             (scheduledChanges: ScheduledChangeType[]) =>
                 scheduledChanges.filter(
-                    (sc) => !sc.is_recurring && !sc.recurrence_interval && !sc.cron_expression && !sc.executed_at
+                    (sc) =>
+                        !sc.is_recurring &&
+                        !sc.recurrence_interval &&
+                        !sc.cron_expression &&
+                        !sc.executed_at &&
+                        !isScheduleDeniedApproval(sc)
                 ),
         ],
         completedSchedules: [
             (s) => [s.scheduledChanges],
             (scheduledChanges: ScheduledChangeType[]) =>
-                scheduledChanges.filter((sc) => !!sc.executed_at).sort(byExecutedAt),
+                scheduledChanges.filter((sc) => !!sc.executed_at || isScheduleDeniedApproval(sc)).sort(byExecutedAt),
         ],
         activeSchedules: [
             (s) => [s.activeRecurringSchedules, s.pausedRecurringSchedules, s.upcomingOneTimeSchedules],
