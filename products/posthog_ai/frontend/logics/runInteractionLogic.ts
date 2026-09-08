@@ -2,13 +2,13 @@ import { MakeLogicType, actions, connect, kea, key, listeners, path, props, redu
 import { forms } from 'kea-forms'
 import type { DeepPartial, DeepPartialMap, FieldName, ValidationErrorType } from 'kea-forms'
 
+import { ApiError } from 'lib/api-error'
 import { lemonToast } from 'lib/lemon-ui/LemonToast'
 import { projectLogic } from 'scenes/projectLogic'
 import { aiConsentLogic } from 'scenes/settings/organization/aiConsentLogic'
 
 import {
     buildRunCreateRequest,
-    DEFAULT_COMPOSER_EFFORT,
     DEFAULT_COMPOSER_MODEL,
     resolveEffortForModel,
 } from 'products/posthog_ai/frontend/utils/composerModels'
@@ -27,15 +27,19 @@ import {
     type ModelChoiceApi,
     type ReasoningEffortEnumApi,
     RuntimeAdapterEnumApi,
+    type WarmTaskResumeRequestApi,
 } from 'products/tasks/frontend/generated/api.schemas'
 
 import { type AttachedContextItem, attachedContextItemKey } from '../types/contextTypes'
 import type { PermissionRequestRecord } from '../types/streamTypes'
 import { contextItemLine, wrapWithPosthogContext } from '../utils/posthogContextBlock'
+import { submitWithWarmRunRetry } from '../utils/warmRunSubmission'
 import { attachedContextLogic } from './attachedContextLogic'
 import { modelCatalogueLogic } from './modelCatalogueLogic'
 import { isTerminalRunStatus, runStreamLogic } from './runStreamLogic'
 import type { RunStatus } from './runStreamLogic'
+import { taskRunDefaultsLogic } from './taskRunDefaultsLogic'
+import { taskWarmLogic } from './taskWarmLogic'
 import { toolStreamEventsLogic } from './toolStreamEventsLogic'
 
 export interface RunInteractionLogicProps {
@@ -96,6 +100,8 @@ export interface runInteractionLogicValues {
     isThinking: boolean // runStreamLogic
     pendingPermissionRequest: PermissionRequestRecord | null // runStreamLogic
     respondingToPermission: boolean // runStreamLogic
+    defaultEffort: string | null // taskRunDefaultsLogic
+    defaultModel: string | null // taskRunDefaultsLogic
     canSend: boolean
     clearing: boolean
     composerForm: {
@@ -165,6 +171,15 @@ export interface runInteractionLogicActions {
               }
             | undefined
     } // runStreamLogic
+    handleTerminalStatus: (status: {
+        errorMessage?: string | null
+        replayedFromHistory?: boolean
+        status: RunStatus
+    }) => {
+        errorMessage?: string | null | undefined
+        replayedFromHistory?: boolean | undefined
+        status: RunStatus
+    } // runStreamLogic
     markTurnComplete: () => {
         value: true
     } // runStreamLogic
@@ -188,6 +203,19 @@ export interface runInteractionLogicActions {
     setCurrentMode: (mode: string) => {
         mode: string
     } // runStreamLogic
+    consumeWarm: () => {
+        value: true
+    } // taskWarmLogic
+    noteDraft: (
+        hasText: boolean,
+        request: import('./taskWarmLogic').TaskWarmRequest
+    ) => {
+        hasText: boolean
+        request: import('./taskWarmLogic').TaskWarmRequest
+    } // taskWarmLogic
+    releaseWarm: () => {
+        value: true
+    } // taskWarmLogic
     claimApplyBackTargets: (streamKey: string) => {
         streamKey: string
     } // toolStreamEventsLogic
@@ -323,10 +351,11 @@ export interface runInteractionLogicMeta {
     key: string
     __keaTypeGenInternalSelectorTypes: {
         isTerminal: (currentRunStatus: RunStatus | null) => boolean
-        selectedModel: (modelOverride: string | null, arg: any) => string
+        selectedModel: (modelOverride: string | null, arg: any, defaultModel: string | null) => string
         selectedEffort: (
             effortOverride: string | null,
             arg: any,
+            defaultEffort: string | null,
             selectedModel: string,
             catalogue: ModelChoiceApi[]
         ) => ReasoningEffortEnumApi
@@ -392,6 +421,8 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
             ['dataProcessingAccepted'],
             modelCatalogueLogic,
             ['catalogue'],
+            taskRunDefaultsLogic,
+            ['defaultModel', 'defaultEffort'],
         ],
         actions: [
             runStreamLogic({ streamKey: props.streamKey ?? props.runId }),
@@ -402,11 +433,14 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                 'cancelRun',
                 'markTurnComplete',
                 'setCurrentMode',
+                'handleTerminalStatus',
             ],
             attachedContextLogic,
             ['markContextSent'],
             toolStreamEventsLogic,
             ['claimApplyBackTargets', 'transferApplyBackTargets', 'releaseApplyBackTargets'],
+            taskWarmLogic({ taskId: props.taskId, resumeFromRunId: props.runId }),
+            ['noteDraft', 'consumeWarm', 'releaseWarm'],
         ],
     })),
 
@@ -599,20 +633,22 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
             (status: null | import('./runStreamLogic').RunStatus): boolean => isTerminalRunStatus(status),
         ],
         // The model/effort to display in the picker and launch the next run with: the optimistic client-side
-        // override, else the run's stored value, else the default. Effort is clamped to one the model supports.
+        // override, else the run's stored value, else the server-resolved default (user preference over
+        // project default), else the built-in default. Effort is clamped to one the model supports.
         selectedModel: [
-            (s) => [s.modelOverride, (_, p) => p.currentModel],
-            (override: string | null, current): string => override ?? current ?? DEFAULT_COMPOSER_MODEL,
+            (s) => [s.modelOverride, (_, p) => p.currentModel, s.defaultModel],
+            (override: string | null, current, serverDefault: string | null): string =>
+                override ?? current ?? serverDefault ?? DEFAULT_COMPOSER_MODEL,
         ],
         selectedEffort: [
-            (s) => [s.effortOverride, (_, p) => p.currentEffort, s.selectedModel, s.catalogue],
+            (s) => [s.effortOverride, (_, p) => p.currentEffort, s.defaultEffort, s.selectedModel, s.catalogue],
             (
                 override: string | null,
                 current: string | null | undefined,
+                serverDefault: string | null,
                 model: string,
                 catalogue: ModelChoiceApi[]
-            ): ReasoningEffortEnumApi =>
-                resolveEffortForModel(catalogue, override ?? current ?? DEFAULT_COMPOSER_EFFORT, model),
+            ): ReasoningEffortEnumApi => resolveEffortForModel(catalogue, override ?? current ?? serverDefault, model),
         ],
         // The permission mode to display and launch with: the client-side override, else the session's live
         // mode (from the stream's `current_mode_update` frames), else the run's stored launch mode, else the
@@ -678,7 +714,24 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
         ],
     }),
 
-    listeners(({ actions, values, props }) => {
+    listeners(({ actions, values, props, cache }) => {
+        const noteTerminalDraft = (): void => {
+            // Consent gates warming as it gates sending: a warm boots a cloud sandbox and restores
+            // the task's repository snapshot, so typing must not start one before the organization
+            // accepts AI data processing.
+            if (!values.isTerminal || !values.dataProcessingAccepted) {
+                return
+            }
+            const createRequest = buildRunCreateRequest(
+                values.catalogue,
+                values.selectedModel,
+                values.selectedEffort,
+                values.selectedMode,
+                { resume_from_run_id: props.runId }
+            )
+            actions.noteDraft(Boolean(values.composerForm.draft.trim()), createRequest as WarmTaskResumeRequestApi)
+        }
+
         // Record the non-text refs just wrapped into a send under the task, so no later send anywhere in
         // the task's resume chain (including the next run after a terminal-run send) re-inflates them.
         const markPendingContextSent = (pendingContext: AttachedContextItem[]): void => {
@@ -729,10 +782,11 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                     // `set_config_option` command before the message rather than ride inside `user_message`. A
                     // failure here aborts the send (the catch restores the content); `setSent*` runs only after a
                     // successful sync so the next send retries an unsent change.
-                    const activeModel = values.sentModel ?? props.currentModel ?? DEFAULT_COMPOSER_MODEL
+                    const activeModel =
+                        values.sentModel ?? props.currentModel ?? values.defaultModel ?? DEFAULT_COMPOSER_MODEL
                     const activeEffort = resolveEffortForModel(
                         values.catalogue,
-                        values.sentEffort ?? props.currentEffort ?? DEFAULT_COMPOSER_EFFORT,
+                        values.sentEffort ?? props.currentEffort ?? values.defaultEffort,
                         activeModel
                     )
                     if (values.selectedModel !== activeModel) {
@@ -807,7 +861,14 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                 if (resolvedEffort !== currentEffort) {
                     actions.setEffort(resolvedEffort)
                 }
+                noteTerminalDraft()
             },
+
+            setEffort: noteTerminalDraft,
+            setMode: noteTerminalDraft,
+            setComposerFormValue: noteTerminalDraft,
+            setComposerFormValues: noteTerminalDraft,
+            handleTerminalStatus: noteTerminalDraft,
 
             startNewRun: async ({ content }) => {
                 if (values.startingRun || !content.trim() || values.currentProjectId == null) {
@@ -817,6 +878,8 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                 const streamKey = props.streamKey ?? props.runId
                 let claimedStreamKey = streamKey
                 const pendingContext = values.pendingContextItems
+                const disposables = cache.disposables
+                const projectId = String(values.currentProjectId)
                 actions.claimApplyBackTargets(streamKey)
                 try {
                     // Same endpoint as the "Run again" button, but seeded with the user's message and chained
@@ -833,7 +896,11 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                             pending_user_message: wrapWithPosthogContext(content, pendingContext),
                         }
                     )
-                    const result = await tasksRunCreate(String(values.currentProjectId), props.taskId, createRequest)
+                    actions.consumeWarm()
+                    const result = await submitWithWarmRunRetry(
+                        (options) => tasksRunCreate(projectId, props.taskId, createRequest, options),
+                        disposables
+                    )
                     actions.resetComposerForm()
                     markPendingContextSent(pendingContext)
                     const latestRunId = result.latest_run?.id
@@ -844,11 +911,20 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                     } else {
                         actions.releaseApplyBackTargets(streamKey)
                     }
-                } catch {
+                } catch (error) {
+                    if (disposables.isDisposed) {
+                        return
+                    }
                     actions.releaseApplyBackTargets(claimedStreamKey)
-                    lemonToast.error('Failed to start a new run. Please try again.')
+                    lemonToast.error(
+                        error instanceof ApiError && error.code === 'warm_run_activation_unavailable'
+                            ? "Couldn't start this run yet. Please try again."
+                            : 'Failed to start a new run. Please try again.'
+                    )
                 } finally {
-                    actions.setStartingRun(false)
+                    if (!disposables.isDisposed) {
+                        actions.setStartingRun(false)
+                    }
                 }
             },
 
@@ -859,6 +935,10 @@ export const runInteractionLogic = kea<runInteractionLogicType>([
                 actions.setClearing(true)
                 try {
                     await tasksRunsClearConversationCreate(String(values.currentProjectId), props.taskId, props.runId)
+                    // Any successor held right now was warmed before this boundary was written, so its
+                    // restored session still carries the conversation the clear just removed. Hand it
+                    // back; the next keystroke warms a fresh one on the cleared state.
+                    actions.releaseWarm()
                     actions.resetComposerForm()
                     // A finished run has no live stream to echo these back, so paint them from here.
                     // They match what the backend persisted, so a later replay folds the same thread.

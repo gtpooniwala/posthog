@@ -1,1 +1,1 @@
-0094_delete_session_analysis_source_configs
+0119_squash_2026_09_07_schema_addons

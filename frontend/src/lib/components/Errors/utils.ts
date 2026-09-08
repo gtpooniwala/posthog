@@ -1,5 +1,7 @@
 import { P, match } from 'ts-pattern'
 
+import { isObject } from 'lib/utils/guards'
+
 import { isPostHogProperty } from '~/taxonomy/taxonomy'
 
 import {
@@ -46,9 +48,14 @@ export function getRuntimeFromLib(lib?: string | null): ErrorTrackingRuntime {
             return 'flutter'
         case 'posthog-elixir':
             return 'elixir'
+        // posthog-server is the current java server SDK identifier; posthog-java is the
+        // tombstoned legacy SDK, kept so already-ingested events still resolve.
+        case 'posthog-server':
         case 'posthog-java':
         case 'analytics-java':
             return 'java'
+        case 'posthog-kmp':
+            return 'kotlin'
         default:
             return 'unknown'
     }
@@ -68,13 +75,15 @@ export function concatValues(
     return definedKeys.map((key) => attrs[key]).join(' ')
 }
 
+function nonEmptyString(value: unknown): string | undefined {
+    return typeof value === 'string' && value.length > 0 ? value : undefined
+}
+
 export function getExceptionAttributes(properties: Record<string, any>): ExceptionAttributes {
     const {
         $lib: lib,
         $lib_version: libVersion,
-        $browser: browser,
         $browser_version: browserVersion,
-        $os: os,
         $os_version: osVersion,
         $sentry_url: sentryUrl,
         $exception_level: level,
@@ -106,6 +115,10 @@ export function getExceptionAttributes(properties: Record<string, any>): Excepti
     const runtime: ErrorTrackingRuntime = getRuntimeFromLib(lib)
     const appNamespace = properties.$app_namespace
     const appVersion = properties.$app_version
+    // Misbehaving SDKs can send non-string values, which would crash PropertyIcon's lowercase lookup.
+    const browser = nonEmptyString(properties.$browser)
+    // Mobile SDKs report the platform in $os_name and leave $os unset; web SDKs do the opposite.
+    const os = nonEmptyString(properties.$os_name) ?? nonEmptyString(properties.$os)
 
     return {
         type,
@@ -165,17 +178,25 @@ function processExceptionList(exceptionList: ErrorTrackingException[] = []): Err
 }
 
 function ensureFrameIdFormat(exceptionList: ErrorTrackingException[]): ErrorTrackingException[] {
-    exceptionList = exceptionList.map((exception) => {
-        if (!exception.stacktrace || !exception.stacktrace.frames || !Array.isArray(exception.stacktrace.frames)) {
+    return exceptionList.map((exception) => {
+        const stacktrace = exception.stacktrace
+        if (!stacktrace || !Array.isArray(stacktrace.frames)) {
             return exception
         }
-        exception.stacktrace.frames = exception.stacktrace.frames.map((frame) => {
-            frame.raw_id = frame.raw_id ? coerceLegacyRawId(frame.raw_id) : frame.raw_id
-            return frame
-        })
-        return exception
+        const frames = stacktrace.frames.filter(isFrameObject).map((frame) => ({
+            ...frame,
+            raw_id: typeof frame.raw_id === 'string' && frame.raw_id ? coerceLegacyRawId(frame.raw_id) : frame.raw_id,
+        }))
+        return { ...exception, stacktrace: { ...stacktrace, frames } }
     })
-    return exceptionList
+}
+
+function isFrameObject(frame: unknown): frame is ErrorTrackingStackFrame {
+    return isObject(frame)
+}
+
+function isExceptionObject(exception: unknown): exception is ErrorTrackingException {
+    return isObject(exception)
 }
 
 function coerceLegacyRawId(rawId: string): string {
@@ -248,7 +269,7 @@ function ensureStringExceptionValues(exceptionList: ErrorTrackingException[]): E
         return []
     }
 
-    return exceptionList.map((exception) => ({
+    return exceptionList.filter(isExceptionObject).map((exception) => ({
         ...exception,
         value: stringify(exception.value),
     }))

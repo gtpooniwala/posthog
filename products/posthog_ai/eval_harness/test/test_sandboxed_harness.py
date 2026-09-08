@@ -16,8 +16,13 @@ from parameterized import parameterized
 from products.posthog_ai.eval_harness import runner
 from products.posthog_ai.eval_harness.config import AgentArtifacts, SandboxedEvalCase
 from products.posthog_ai.eval_harness.harness.cli import parse_args
+from products.posthog_ai.eval_harness.harness.lifecycle import eval_feature_enabled
 from products.posthog_ai.eval_harness.harness.live_server import EvalLiveServer
 from products.posthog_ai.eval_harness.harness.providers import ModalProviderStrategy, SandboxProviderStrategy
+from products.tasks.backend.constants import (
+    WORKFLOW_DISPATCH_ASYNC_FEATURE_FLAG,
+    WORKFLOW_DISPATCH_RESTART_FEATURE_FLAG,
+)
 from products.tasks.backend.facade.agents import TurnPollResult
 
 
@@ -141,6 +146,17 @@ def test_parse_args_resolves_team_setup_concurrency(
         options = parse_args([])
 
     assert options.team_setup_concurrency == expected_concurrency
+
+
+@parameterized.expand(
+    [
+        ("workflow dispatch async", WORKFLOW_DISPATCH_ASYNC_FEATURE_FLAG, False),
+        ("workflow dispatch restart", WORKFLOW_DISPATCH_RESTART_FEATURE_FLAG, False),
+        ("anything else", "tasks-modal-vm-sandbox", True),
+    ]
+)
+def test_eval_feature_enabled_leaves_dispatcher_flags_off(_name: str, flag: str, expected: bool) -> None:
+    assert eval_feature_enabled(flag, distinct_id="distinct-1") is expected
 
 
 @pytest.mark.asyncio
@@ -303,3 +319,23 @@ class TestAgentRunFailureDetection:
     ) -> None:
         artifacts = AgentArtifacts(exit_code=1 if stderr else 0, stderr=stderr, tool_call_count=tool_call_count)
         assert runner.agent_never_ran(artifacts) is expected
+
+
+class TestSliceTurnLogs:
+    def test_slices_by_turn_line_marks(self) -> None:
+        log = "\n".join(f'{{"line": {i}}}' for i in range(5))
+        assert runner._slice_turn_logs(log, [2, 5]) == [
+            '{"line": 0}\n{"line": 1}',
+            '{"line": 2}\n{"line": 3}\n{"line": 4}',
+        ]
+
+    def test_single_turn_spans_the_whole_log(self) -> None:
+        log = "\n".join(f'{{"line": {i}}}' for i in range(3))
+        assert runner._slice_turn_logs(log, [3]) == [log]
+
+    def test_marks_past_the_line_count_disable_slicing(self) -> None:
+        log = "\n".join(f'{{"line": {i}}}' for i in range(3))
+        assert runner._slice_turn_logs(log, [2, 9]) is None
+
+    def test_a_malformed_line_disables_slicing(self) -> None:
+        assert runner._slice_turn_logs('{"line": 0}\nnot json\n{"line": 1}', [1, 3]) is None

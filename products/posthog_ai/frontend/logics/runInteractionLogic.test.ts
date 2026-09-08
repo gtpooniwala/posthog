@@ -1,5 +1,6 @@
 import { expectLogic } from 'kea-test-utils'
 
+import { ApiError } from 'lib/api-error'
 import { lemonToast } from 'lib/lemon-ui/LemonToast'
 import { projectLogic } from 'scenes/projectLogic'
 import { aiConsentLogic } from 'scenes/settings/organization/aiConsentLogic'
@@ -8,8 +9,10 @@ import { initKeaTests } from '~/test/init'
 
 import {
     tasksRunCreate,
+    tasksRunsCancelCreate,
     tasksRunsClearConversationCreate,
     tasksRunsCommandCreate,
+    tasksWarmResumeCreate,
 } from 'products/tasks/frontend/generated/api'
 
 import { contextItemLine } from '../utils/posthogContextBlock'
@@ -34,6 +37,7 @@ jest.mock('./runStreamLogic', () => {
             cancelRun: (run?: unknown) => ({ run }),
             markTurnComplete: true,
             setCurrentMode: (mode: string) => ({ mode }),
+            handleTerminalStatus: (status: string) => ({ status }),
             setStubStatus: (status: string | null) => ({ status }),
             setStubThinking: (thinking: boolean) => ({ thinking }),
             setStubClearSupported: (supported: boolean) => ({ supported }),
@@ -43,6 +47,7 @@ jest.mock('./runStreamLogic', () => {
                 'in_progress',
                 {
                     setStubStatus: (_: string | null, { status }: { status: string | null }) => status,
+                    handleTerminalStatus: (_: string | null, { status }: { status: string }) => status,
                 },
             ],
             isThinking: [
@@ -95,6 +100,8 @@ jest.mock('products/tasks/frontend/generated/api', () => ({
     tasksRunsCommandCreate: jest.fn(),
     tasksRunCreate: jest.fn(),
     tasksRunsClearConversationCreate: jest.fn(),
+    tasksWarmResumeCreate: jest.fn(),
+    tasksRunsCancelCreate: jest.fn(),
 }))
 
 jest.mock('lib/lemon-ui/LemonToast', () => ({
@@ -136,6 +143,7 @@ describe('runInteractionLogic', () => {
         ;(tasksRunsCommandCreate as jest.Mock).mockResolvedValue({})
         ;(tasksRunCreate as jest.Mock).mockResolvedValue({ latest_run: { id: 'run-2' } })
         ;(tasksRunsClearConversationCreate as jest.Mock).mockResolvedValue({})
+        ;(tasksWarmResumeCreate as jest.Mock).mockResolvedValue({ task_id: TASK_ID, run_id: 'warm-run' })
         initKeaTests()
         project = projectLogic()
         project.mount()
@@ -288,7 +296,8 @@ describe('runInteractionLogic', () => {
         expect(tasksRunCreate).toHaveBeenCalledWith(
             '997',
             TASK_ID,
-            expect.objectContaining({ initial_permission_mode: 'bypassPermissions' })
+            expect.objectContaining({ initial_permission_mode: 'bypassPermissions' }),
+            expect.objectContaining({ signal: expect.any(AbortSignal) })
         )
     })
 
@@ -363,14 +372,19 @@ describe('runInteractionLogic', () => {
 
         // No live-run signal for a finished run — it resumes into a new run instead.
         expect(tasksRunsCommandCreate).not.toHaveBeenCalled()
-        expect(tasksRunCreate).toHaveBeenCalledWith('997', TASK_ID, {
-            runtime_adapter: 'claude',
-            model: 'claude-sonnet-5',
-            reasoning_effort: 'high',
-            initial_permission_mode: 'plan',
-            resume_from_run_id: RUN_ID,
-            pending_user_message: 'continue from here',
-        })
+        expect(tasksRunCreate).toHaveBeenCalledWith(
+            '997',
+            TASK_ID,
+            {
+                runtime_adapter: 'claude',
+                model: 'claude-sonnet-5',
+                reasoning_effort: 'high',
+                initial_permission_mode: 'auto',
+                resume_from_run_id: RUN_ID,
+                pending_user_message: 'continue from here',
+            },
+            expect.objectContaining({ signal: expect.any(AbortSignal) })
+        )
         expect(onRunStarted).toHaveBeenCalledWith('run-2')
         expect(toolEvents.values.applyBackTargetClaims[RUN_ID]).toBeUndefined()
         expect(toolEvents.values.applyBackTargetClaims['run-2']).toEqual([
@@ -378,6 +392,34 @@ describe('runInteractionLogic', () => {
         ])
         expect(logic.values.queuedMessages).toEqual([])
         expect(logic.values.composerForm.draft).toBe('')
+    })
+
+    it('warms the resumed run while composing and consumes it before submit', async () => {
+        jest.useFakeTimers()
+        setStatus('cancelled')
+        logic.actions.setComposerFormValues({ draft: 'continue from the checkpoint' })
+        jest.advanceTimersByTime(300)
+        jest.useRealTimers()
+
+        await expectLogic(logic).toFinishAllListeners()
+        expect(tasksWarmResumeCreate).toHaveBeenCalledWith('997', TASK_ID, {
+            resume_from_run_id: RUN_ID,
+            runtime_adapter: 'claude',
+            model: 'claude-sonnet-5',
+            reasoning_effort: 'high',
+            initial_permission_mode: 'auto',
+        })
+
+        await expectLogic(logic, () => {
+            logic.actions.submitComposerForm()
+        }).toFinishAllListeners()
+
+        expect(tasksRunCreate).toHaveBeenCalledWith(
+            '997',
+            TASK_ID,
+            expect.objectContaining({ resume_from_run_id: RUN_ID }),
+            expect.objectContaining({ signal: expect.any(AbortSignal) })
+        )
     })
 
     it('records the boundary instead of starting a run when /clear is sent to a terminal run', async () => {
@@ -399,6 +441,29 @@ describe('runInteractionLogic', () => {
         ])
     })
 
+    it('hands back a warmed successor when /clear succeeds', async () => {
+        // The successor booted before the clear boundary was written, so its restored session still
+        // holds the conversation /clear promises to remove. Keeping it would let the next message
+        // resume the very thing the user just cleared.
+        jest.useFakeTimers()
+        setStatus('completed')
+        logic.actions.setComposerFormValues({ draft: 'keep going' })
+        jest.advanceTimersByTime(300)
+        jest.useRealTimers()
+        await expectLogic(logic).toFinishAllListeners()
+        expect(tasksWarmResumeCreate).toHaveBeenCalled()
+
+        logic.actions.setComposerFormValues({ draft: '/clear' })
+        await expectLogic(logic, () => {
+            logic.actions.submitComposerForm()
+        }).toFinishAllListeners()
+
+        expect(tasksRunsClearConversationCreate).toHaveBeenCalled()
+        expect(tasksRunsCancelCreate).toHaveBeenCalledWith('997', TASK_ID, 'warm-run', {
+            only_if_awaiting_first_message: true,
+        })
+    })
+
     it('falls back to a new run when the chain agent cannot honour the clear boundary', async () => {
         // An older agent ignores the marker and resumes the conversation it was meant to retire,
         // so a divider here would claim a clear that never happens.
@@ -414,20 +479,135 @@ describe('runInteractionLogic', () => {
         expect(tasksRunCreate).toHaveBeenCalled()
     })
 
-    it('keeps the draft and toasts when starting a new run fails', async () => {
-        ;(tasksRunCreate as jest.Mock).mockRejectedValue(new Error('boom'))
+    test.each([
+        [new Error('boom'), 'Failed to start a new run. Please try again.'],
+        [
+            new ApiError('starting', 503, undefined, { code: 'warm_run_activation_unavailable' }),
+            "Couldn't start this run yet. Please try again.",
+        ],
+    ])('keeps the draft and unsent context when starting a run fails with %s', async (error, message) => {
+        let rejectSend!: (error: unknown) => void
+        ;(tasksRunCreate as jest.Mock).mockReturnValueOnce(
+            new Promise((_, reject) => {
+                rejectSend = reject
+            })
+        )
+        attachedContextLogic().actions.registerContext('scene', [{ type: 'insight', key: 'sig', label: 'Signups' }])
         setStatus('completed')
         logic.actions.setComposerFormValues({ draft: 'continue from here' })
+        logic.actions.submitComposerForm()
+
+        expect(logic.values.startingRun).toBe(true)
+        expect(logic.values.composerForm.draft).toBe('continue from here')
+        expect(attachedContextLogic().values.sentContextKeysByTask[TASK_ID]).toBeUndefined()
 
         await expectLogic(logic, () => {
-            logic.actions.submitComposerForm()
+            rejectSend(error)
         }).toFinishAllListeners()
 
-        expect(lemonToast.error).toHaveBeenCalled()
+        expect(lemonToast.error).toHaveBeenCalledWith(message)
         expect(onRunStarted).not.toHaveBeenCalled()
+        expect(logic.values.startingRun).toBe(false)
         expect(logic.values.composerForm.draft).toBe('continue from here')
+        expect(logic.values.pendingContextItems).toEqual([{ type: 'insight', key: 'sig', label: 'Signups' }])
         expect(toolEvents.values.applyBackTargetClaims[RUN_ID]).toBeUndefined()
+
+        await expectLogic(logic, () => logic.actions.submitComposerForm()).toFinishAllListeners()
+
+        expect(tasksRunCreate).toHaveBeenCalledTimes(2)
+        expect((tasksRunCreate as jest.Mock).mock.calls[1].slice(0, 3)).toEqual(
+            (tasksRunCreate as jest.Mock).mock.calls[0].slice(0, 3)
+        )
+        expect(onRunStarted).toHaveBeenCalledWith('run-2')
+        expect(logic.values.composerForm.draft).toBe('')
+        expect(logic.values.startingRun).toBe(false)
+        expect(attachedContextLogic().values.sentContextKeysByTask[TASK_ID]).toEqual(['insight:sig'])
     })
+
+    test.each(['recovered', 'exhausted', 'timeout', 'unmounted'])(
+        'keeps a resumed submission pending through bounded frontend retries: %s',
+        async (outcome) => {
+            jest.useFakeTimers()
+            const error = new ApiError('starting', 503, undefined, {
+                code: 'warm_run_activation_unavailable',
+                retry_token: 'synthetic-retry-token',
+            })
+            let rejectFirst!: (error: unknown) => void
+            let resolveRetry!: (value: unknown) => void
+            let rejectRetry!: (error: unknown) => void
+            ;(tasksRunCreate as jest.Mock)
+                .mockReturnValueOnce(new Promise((_, reject) => (rejectFirst = reject)))
+                .mockRejectedValueOnce(error)
+                .mockRejectedValueOnce(error)
+                .mockReturnValueOnce(
+                    new Promise((resolve, reject) => {
+                        resolveRetry = resolve
+                        rejectRetry = reject
+                    })
+                )
+            try {
+                attachedContextLogic().actions.registerContext('scene', [
+                    { type: 'insight', key: 'sig', label: 'Signups' },
+                ])
+                setStatus('completed')
+                logic.actions.setComposerFormValues({ draft: 'continue from here' })
+                logic.actions.submitComposerForm()
+                await jest.advanceTimersByTimeAsync(10_000)
+                rejectFirst(error)
+                await jest.advanceTimersByTimeAsync(1750)
+                expect(tasksRunCreate).toHaveBeenCalledTimes(4)
+                const calls = (tasksRunCreate as jest.Mock).mock.calls
+                for (const call of calls.slice(1)) {
+                    expect(call.slice(0, 3)).toEqual(calls[0].slice(0, 3))
+                    expect(call[3].headers).toEqual({ 'X-PostHog-Warm-Retry': 'synthetic-retry-token' })
+                }
+                expect(logic.values.startingRun).toBe(true)
+                expect(logic.values.composerForm.draft).toBe('continue from here')
+                expect(attachedContextLogic().values.sentContextKeysByTask[TASK_ID]).toBeUndefined()
+                logic.actions.submitComposerForm()
+                expect(tasksRunCreate).toHaveBeenCalledTimes(4)
+                if (outcome === 'unmounted') {
+                    logic.unmount()
+                    resolveRetry({ latest_run: { id: 'warm-run' } })
+                    await jest.advanceTimersByTimeAsync(10_000)
+                    expect(calls[1][3].signal.aborted).toBe(true)
+                    expect(onRunStarted).not.toHaveBeenCalled()
+                    return
+                }
+                await jest.advanceTimersByTimeAsync(8_249)
+                expect(logic.values.startingRun).toBe(true)
+                await expectLogic(logic, async () => {
+                    if (outcome === 'recovered') {
+                        resolveRetry({ latest_run: { id: 'warm-run' } })
+                    } else if (outcome === 'exhausted') {
+                        rejectRetry(
+                            new ApiError('starting', 503, undefined, { code: 'warm_run_activation_unavailable' })
+                        )
+                    } else {
+                        await jest.advanceTimersByTimeAsync(1)
+                    }
+                }).toFinishAllListeners()
+                expect(tasksRunCreate).toHaveBeenCalledTimes(4)
+                expect(logic.values.startingRun).toBe(false)
+                if (outcome === 'recovered') {
+                    expect(onRunStarted).toHaveBeenCalledWith('warm-run')
+                    expect(logic.values.composerForm.draft).toBe('')
+                } else {
+                    expect(onRunStarted).not.toHaveBeenCalled()
+                    expect(logic.values.composerForm.draft).toBe('continue from here')
+                    expect(logic.values.pendingContextItems).toEqual([
+                        { type: 'insight', key: 'sig', label: 'Signups' },
+                    ])
+                    expect(lemonToast.error).toHaveBeenCalledWith("Couldn't start this run yet. Please try again.")
+                    resolveRetry({ latest_run: { id: 'late-run' } })
+                    await jest.advanceTimersByTimeAsync(0)
+                    expect(onRunStarted).not.toHaveBeenCalled()
+                }
+            } finally {
+                jest.useRealTimers()
+            }
+        }
+    )
 
     it('wraps outgoing content with the attached-context block while echoing the raw text, and dedupes per task', async () => {
         attachedContextLogic().actions.registerContext('scene', [
@@ -711,11 +891,20 @@ describe('runInteractionLogic', () => {
         const blockedLogic = runInteractionLogic({ taskId: TASK_ID, runId: blockedRunId, onRunStarted })
         blockedLogic.mount()
 
+        // Terminal, so typing would otherwise warm a successor — which boots a cloud sandbox and
+        // restores the repository snapshot, before the organization has accepted anything.
+        ;(blockedStream.actions as unknown as { setStubStatus: (status: string | null) => void }).setStubStatus(
+            'completed'
+        )
+        jest.useFakeTimers()
         blockedLogic.actions.setComposerFormValues({ draft: 'ship it' })
+        jest.advanceTimersByTime(300)
+        jest.useRealTimers()
         await expectLogic(blockedLogic, () => {
             blockedLogic.actions.submitComposerForm()
         }).toFinishAllListeners()
 
+        expect(tasksWarmResumeCreate).not.toHaveBeenCalled()
         expect(tasksRunsCommandCreate).not.toHaveBeenCalled()
         expect(tasksRunCreate).not.toHaveBeenCalled()
         expect(blockedLogic.values.consentBlocked).toBe(true)
